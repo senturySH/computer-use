@@ -17,6 +17,30 @@ import Jimp from 'jimp';
 import sharp from 'sharp';
 import {toKeys} from '../xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
+import {CursorOverlay} from './cursor-overlay.js';
+
+// Lazy-init virtual cursor overlay
+let overlay: CursorOverlay | null = null;
+async function getOverlay(): Promise<CursorOverlay | null> {
+	if (!overlay) {
+		overlay = new CursorOverlay();
+		try {
+			await overlay.start();
+		} catch {
+			// Overlay is optional
+			overlay = null;
+		}
+	}
+	return overlay;
+}
+
+/** Move virtual cursor to position if overlay is running. */
+async function syncOverlay(x: number, y: number, style?: string): Promise<void> {
+	const ov = await getOverlay();
+	if (!ov?.isRunning) return;
+	if (style) ov.setStyle(style as any);
+	ov.move(x, y);
+}
 
 /**
  * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js fails
@@ -148,7 +172,7 @@ const actionDescription = `The action to perform. The available actions are:
 * middle_click: Click the middle mouse button. If coordinate is provided, moves to that position first.
 * double_click: Double-click the left mouse button. If coordinate is provided, moves to that position first.
 * scroll: Scroll the screen in a specified direction. Requires coordinate (moves there first) and text parameter with direction: "up", "down", "left", or "right". Optionally append ":N" to scroll N pixels (default 300), e.g. "down:500".
-* get_screenshot: Take a screenshot of the screen.`;
+* get_screenshot: Take a screenshot of the visible screen. This does not capture covered or background windows that are not currently visible; use \`capture_window\` for those.`;
 
 const toolDescription = `Use a mouse and keyboard to interact with a computer, and take screenshots.
 * This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.
@@ -156,6 +180,7 @@ const toolDescription = `Use a mouse and keyboard to interact with a computer, a
 * If you see boxes with two letters in them, typing these letters will click that element. Use this instead of other shortcuts or clicking, where possible.
 * Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try taking another screenshot.
 * Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.
+* \`get_screenshot\` only shows the currently visible screen contents. For background windows, covered windows, or windows you want to target without bringing them to the front, use the window tools: \`windows\`, \`capture_window\`, \`get_ax_tree\`, and \`window_action\`.
 * If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.
 * Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.
 
@@ -253,12 +278,14 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					await syncOverlay(scaledCoordinate[0], scaledCoordinate[1], 'pointer');
 					return jsonResult({ok: true});
 				}
 
 				case 'left_click': {
 					if (scaledCoordinate) {
 						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await syncOverlay(scaledCoordinate[0], scaledCoordinate[1], 'click');
 					}
 
 					await mouse.leftClick();
@@ -272,6 +299,7 @@ export function registerComputer(server: McpServer): void {
 
 					await mouse.pressButton(Button.LEFT);
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					await syncOverlay(scaledCoordinate[0], scaledCoordinate[1]);
 					await mouse.releaseButton(Button.LEFT);
 					return jsonResult({ok: true});
 				}
@@ -279,6 +307,7 @@ export function registerComputer(server: McpServer): void {
 				case 'right_click': {
 					if (scaledCoordinate) {
 						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await syncOverlay(scaledCoordinate[0], scaledCoordinate[1], 'click');
 					}
 
 					await mouse.rightClick();
@@ -288,6 +317,7 @@ export function registerComputer(server: McpServer): void {
 				case 'middle_click': {
 					if (scaledCoordinate) {
 						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await syncOverlay(scaledCoordinate[0], scaledCoordinate[1]);
 					}
 
 					await mouse.click(Button.MIDDLE);
@@ -297,6 +327,7 @@ export function registerComputer(server: McpServer): void {
 				case 'double_click': {
 					if (scaledCoordinate) {
 						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await syncOverlay(scaledCoordinate[0], scaledCoordinate[1], 'click');
 					}
 
 					await mouse.doubleClick(Button.LEFT);
@@ -328,6 +359,7 @@ export function registerComputer(server: McpServer): void {
 
 					// Move to position first
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					await syncOverlay(scaledCoordinate[0], scaledCoordinate[1]);
 
 					// Scroll in the specified direction
 					switch (direction.toLowerCase()) {

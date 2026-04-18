@@ -1,7 +1,7 @@
 {
-  "name": "computer-use-mcp",
-  "version": "1.8.0",
-  "description": "💻 MCP server for Claude to control your computer",
+  "name": "@pragneshbarik/computer-use",
+  "version": "2.0.0",
+  "description": "💻 MCP server for Claude to control your computer — mouse, keyboard, screenshots, accessibility tree, virtual cursor",
   "license": "MIT",
   "author": "Adam Jones (domdomegg)",
   "repository": {
@@ -13,7 +13,8 @@
   "types": "dist/index.d.ts",
   "bin": "dist/main.js",
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "mcpName": "io.github.domdomegg/computer-use-mcp",
   "scripts": {
@@ -24,7 +25,8 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "lint": "eslint",
     "clean": "rm -rf dist",
-    "build": "tsc --project tsconfig.build.json",
+    "build:native": "bash native/build.sh",
+    "build": "npm run build:native && tsc --project tsconfig.build.json",
     "build:mcpb": "./build-mcpb.sh",
     "prepublishOnly": "npm run clean && npm run build"
   },
