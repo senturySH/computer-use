@@ -1,11 +1,11 @@
 import { execFileSync } from "node:child_process";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Button, Point, mouse } from "@nut-tree-fork/nut-js";
 import sharp from "sharp";
 import { z } from "zod";
 import { osascriptJson } from "../utils/applescript.js";
 import {
   captureNativeWindow,
-  clickNativeWindow,
   listNativeWindows,
   type NativeWindowInfo,
 } from "../utils/window-capture.js";
@@ -71,6 +71,8 @@ const maxPixels = 1.15 * 1024 * 1024;
 
 const axPreamble = String.raw`
 const se = Application("System Events");
+const currentApp = Application.currentApplication();
+currentApp.includeStandardAdditions = true;
 
 function safe(fn, fallback = null) {
 	try {
@@ -461,6 +463,37 @@ function resolveWindowId(
   return target.windowId;
 }
 
+function resolveWindowReference(args: {
+  app?: string | undefined;
+  windowIndex?: number | undefined;
+  windowId?: number | undefined;
+}): { appName: string; windowIndex: number; windowId: number } {
+  const { app, windowIndex, windowId } = args;
+
+  if (windowId !== undefined) {
+    const target = listAllWindows().find((candidate) => candidate.windowId === windowId);
+    if (!target) {
+      throw new Error(`Window ${windowId} not found`);
+    }
+
+    return {
+      appName: target.appName,
+      windowIndex: target.windowIndex,
+      windowId,
+    };
+  }
+
+  if (!app || windowIndex === undefined) {
+    throw new Error("Provide either `window_id` or both `app` and `window_index`.");
+  }
+
+  return {
+    appName: app,
+    windowIndex,
+    windowId: resolveWindowId(app, windowIndex),
+  };
+}
+
 function getNativeWindow(windowId: number): NativeWindowInfo {
   const window = listNativeWindows().find(
     (candidate) => candidate.id === windowId,
@@ -473,6 +506,8 @@ function getNativeWindow(windowId: number): NativeWindowInfo {
 }
 
 async function clickInsideBackgroundWindow(
+  appName: string,
+  windowIndex: number,
   windowId: number,
   x: number,
   y: number,
@@ -503,7 +538,12 @@ async function clickInsideBackgroundWindow(
     }
   }
 
-  clickNativeWindow(windowId, relativeX, relativeY);
+  focusWindow(appName, windowIndex);
+
+  const originalPosition = await mouse.getPosition();
+  await mouse.setPosition(new Point(Math.round(absoluteX), Math.round(absoluteY)));
+  await mouse.click(Button.LEFT);
+  await mouse.setPosition(originalPosition);
 }
 
 function getSizeToApiScale(width: number, height: number): number {
@@ -702,11 +742,88 @@ function axType(
   windowIndex: number,
   target: AXTarget,
   text: string,
-): boolean {
+  submit?: boolean,
+): { ok: boolean; submitted: boolean; submitMethod: string | null } {
   return runJxaJson<{
     ok: boolean;
+    submitted: boolean;
+    submitMethod: string | null;
   }>(`${buildTargetLookup(appName, windowIndex, target, "type")}
+let submitted = false;
+let submitMethod = null;
+
+try {
+	target.focused = true;
+} catch (error) {
+	// Best effort only.
+}
+
 target.value = ${escapeJs(text)};
+
+if (${submit ? "true" : "false"}) {
+	try {
+		target.actions.byName("AXConfirm").perform();
+		submitted = true;
+		submitMethod = "AXConfirm";
+	} catch (error) {
+		try {
+			target.actions.byName("AXPress").perform();
+			submitted = true;
+			submitMethod = "AXPress";
+		} catch (innerError) {
+			try {
+				window.actions.byName("AXRaise").perform();
+			} catch (raiseError) {
+				// Best effort only.
+			}
+
+			try {
+				process.frontmost = true;
+			} catch (frontmostError) {
+				// Best effort only.
+			}
+
+			try {
+				target.focused = true;
+			} catch (focusError) {
+				// Best effort only.
+			}
+
+			delay(0.1);
+			se.keyCode(36);
+			submitted = true;
+			submitMethod = "ReturnKey";
+		}
+	}
+}
+
+JSON.stringify({ok: true, submitted, submitMethod});
+`);
+}
+
+function focusWindow(appName: string, windowIndex: number): boolean {
+  return runJxaJson<{ ok: boolean }>(String.raw`
+const appName = ${escapeJs(appName)};
+const windowIndex = ${windowIndex};
+const process = se.applicationProcesses.byName(appName);
+const window = safe(() => process.windows()[windowIndex - 1], null);
+
+if (!window) {
+	throw new Error("Window " + windowIndex + " not found for " + appName);
+}
+
+try {
+	window.actions.byName("AXRaise").perform();
+} catch (error) {
+	// Not all windows expose AXRaise.
+}
+
+try {
+	process.frontmost = true;
+} catch (error) {
+	// Best effort only.
+}
+
 JSON.stringify({ok: true});
 `).ok;
 }
@@ -953,7 +1070,7 @@ export function registerWindowTools(server: McpServer): void {
       description:
         "Set the value of a text field in a background or unfocused window through the macOS Accessibility API. " +
         "Use `path` from `get_ax_tree` for precise targeting, or provide `role` and optional `title` to find an element by search. " +
-        "If `role` is omitted, text-field lookup is used by default.",
+        "If `role` is omitted, text-field lookup is used by default. Set `submit=true` to also confirm the field after typing (useful for browser address bars and search fields).",
       inputSchema: z
         .object({
           app: z
@@ -984,25 +1101,32 @@ export function registerWindowTools(server: McpServer): void {
               "Exact element label/title to match when searching by role",
             ),
           text: z.string().describe("Text to set as the element value"),
+          submit: z
+            .boolean()
+            .optional()
+            .describe(
+              "Also submit/confirm the field after typing. Tries AXConfirm, then AXPress, then focuses the window and sends Return.",
+            ),
         })
         .strict(),
       annotations: { readOnlyHint: false },
     },
     async (args) => {
-      const { app, window_index, path, role, title, text } = args as {
+      const { app, window_index, path, role, title, text, submit } = args as {
         app: string;
         window_index?: number;
         path?: string;
         role?: string;
         title?: string;
         text: string;
+        submit?: boolean;
       };
 
       validateTarget(path, role ?? "text");
       const target = { path, role: role ?? "text", title };
-      const ok = axType(app, window_index ?? 1, target, text);
+      const result = axType(app, window_index ?? 1, target, text, submit);
 
-      return ok
+      return result.ok
         ? jsonResult({
             ok: true,
             app,
@@ -1010,6 +1134,8 @@ export function registerWindowTools(server: McpServer): void {
             path,
             role: role ?? "text",
             title,
+            submitted: result.submitted,
+            submit_method: result.submitMethod,
           })
         : jsonResult({
             ok: false,
@@ -1023,8 +1149,9 @@ export function registerWindowTools(server: McpServer): void {
     {
       title: "Click Background Window by Image Coordinates",
       description:
-        "Click a pixel coordinate inside a specific window using the image returned by `capture_window`, without moving the real mouse cursor or bringing the window to the front. " +
-        "Use this for background, covered, or unfocused windows that are not reliably targetable through the visible screen screenshot.",
+        "Click a pixel coordinate inside a specific window using the image returned by `capture_window`. " +
+        "On macOS, many apps ignore true background click delivery, so this tool raises the target window, performs a real click at the computed coordinate, then restores the cursor position. " +
+        "Use this when a normal computer screenshot is not enough to target the correct pixel inside a specific app window.",
       inputSchema: z
         .object({
           app: z
@@ -1073,19 +1200,25 @@ export function registerWindowTools(server: McpServer): void {
         show_cursor?: boolean;
       };
 
-      if (window_id === undefined && (!app || window_index === undefined)) {
-        throw new Error(
-          "Provide either `window_id` or both `app` and `window_index`.",
-        );
-      }
-
-      const resolvedWindowId =
-        window_id ?? resolveWindowId(app!, window_index!);
-      await clickInsideBackgroundWindow(resolvedWindowId, x, y, show_cursor);
+      const resolved = resolveWindowReference({
+        app,
+        windowIndex: window_index,
+        windowId: window_id,
+      });
+      await clickInsideBackgroundWindow(
+        resolved.appName,
+        resolved.windowIndex,
+        resolved.windowId,
+        x,
+        y,
+        show_cursor,
+      );
 
       return jsonResult({
         ok: true,
-        window_id: resolvedWindowId,
+        window_id: resolved.windowId,
+        app: resolved.appName,
+        window_index: resolved.windowIndex,
         x,
         y,
       });
