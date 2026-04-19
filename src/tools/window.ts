@@ -141,6 +141,11 @@ function elementFromPath(root, path) {
 	return current;
 }
 
+// Roles that are text-accepting in web/Electron apps
+var textAcceptingRoles = new Set([
+	"axtextfield", "axtextarea", "axcombobox", "axsearchfield",
+]);
+
 function findElement(root, roleCandidates, title) {
 	const wantedTitle = title === null ? null : String(title).toLowerCase();
 	const wantedRoles = Array.isArray(roleCandidates)
@@ -148,22 +153,65 @@ function findElement(root, roleCandidates, title) {
 		: [];
 	const queue = childElements(root).slice();
 
+	// Phase 1: Exact title match
+	var exactMatch = null;
+	// Phase 2: Substring/contains title match (fallback)
+	var substringMatch = null;
+
 	while (queue.length > 0) {
 		const current = queue.shift();
 		if (!current) continue;
 
 		const role = String(safe(() => current.role(), "")).toLowerCase();
 		const label = safe(() => elementLabel(current), null);
+		const labelLower = String(label || "").toLowerCase();
 		const matchesRole = wantedRoles.length === 0 || wantedRoles.includes(role);
-		const matchesTitle = wantedTitle === null || String(label || "").toLowerCase() === wantedTitle;
 
-		if (matchesRole && matchesTitle) {
-			return current;
+		if (matchesRole) {
+			if (wantedTitle === null) {
+				return current; // No title constraint, first role match wins
+			}
+			if (labelLower === wantedTitle && !exactMatch) {
+				exactMatch = current;
+			} else if (!substringMatch && labelLower.indexOf(wantedTitle) !== -1) {
+				substringMatch = current;
+			}
 		}
 
 		queue.push(...childElements(current));
 	}
 
+	return exactMatch || substringMatch || null;
+}
+
+// Find the currently focused element in the tree (useful as fallback)
+function findFocusedElement(root) {
+	const queue = childElements(root).slice();
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (!current) continue;
+
+		if (boolOrFalse(() => current.focused())) {
+			return current;
+		}
+		queue.push(...childElements(current));
+	}
+	return null;
+}
+
+// Find any element that can accept text input (useful as fallback for ax_type)
+function findAnyTextInput(root) {
+	const queue = childElements(root).slice();
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (!current) continue;
+
+		const role = String(safe(() => current.role(), "")).toLowerCase();
+		if (textAcceptingRoles.has(role)) {
+			return current;
+		}
+		queue.push(...childElements(current));
+	}
 	return null;
 }
 `;
@@ -178,26 +226,82 @@ function roleCandidates(role?: string): string[] {
 
   const normalized = role.trim().toLowerCase();
   const aliases: Record<string, string[]> = {
+    // Buttons
     button: ["axbutton"],
     axbutton: ["axbutton"],
+    // Checkboxes
     checkbox: ["axcheckbox"],
     axcheckbox: ["axcheckbox"],
+    // Menus
     menu: ["axmenu"],
     axmenu: ["axmenu"],
     menuitem: ["axmenuitem"],
     axmenuitem: ["axmenuitem"],
+    menubar: ["axmenubar"],
+    axmenubar: ["axmenubar"],
+    // Radio buttons
     radio: ["axradiobutton"],
     axradiobutton: ["axradiobutton"],
+    // Sliders
     slider: ["axslider"],
     axslider: ["axslider"],
-    tab: ["axradioButton", "axtabgroup"].map((value) => value.toLowerCase()),
-    text: ["axtextfield"],
-    textfield: ["axtextfield"],
+    // Tabs
+    tab: ["axradiobutton", "axtabgroup"],
+    axtabgroup: ["axtabgroup"],
+    // Text fields — match all text-accepting roles (native + web)
+    text: ["axtextfield", "axtextarea", "axcombobox"],
+    textfield: ["axtextfield", "axtextarea", "axcombobox"],
     axtextfield: ["axtextfield"],
+    // Text areas
+    textarea: ["axtextarea", "axtextfield"],
+    axtextarea: ["axtextarea"],
+    // Combo boxes (dropdowns with text input)
+    combobox: ["axcombobox"],
+    axcombobox: ["axcombobox"],
+    // Input — generic alias that matches any text-accepting element
+    input: ["axtextfield", "axtextarea", "axcombobox", "axsearchfield"],
+    // Search fields
+    search: ["axsearchfield", "axtextfield"],
+    searchfield: ["axsearchfield", "axtextfield"],
+    axsearchfield: ["axsearchfield"],
+    // Images
     image: ["aximage"],
     aximage: ["aximage"],
+    // Links
     link: ["axlink"],
     axlink: ["axlink"],
+    // Web-specific roles
+    webarea: ["axwebarea"],
+    axwebarea: ["axwebarea"],
+    // Scroll areas
+    scrollarea: ["axscrollarea"],
+    axscrollarea: ["axscrollarea"],
+    // Groups
+    group: ["axgroup"],
+    axgroup: ["axgroup"],
+    // Tables
+    table: ["axtable"],
+    axtable: ["axtable"],
+    row: ["axrow"],
+    axrow: ["axrow"],
+    cell: ["axcell"],
+    axcell: ["axcell"],
+    // Static text
+    statictext: ["axstatictext"],
+    axstatictext: ["axstatictext"],
+    label: ["axstatictext"],
+    // Popups
+    popupbutton: ["axpopupbutton"],
+    axpopupbutton: ["axpopupbutton"],
+    popup: ["axpopupbutton"],
+    dropdown: ["axpopupbutton", "axcombobox"],
+    select: ["axpopupbutton", "axcombobox"],
+    // Toolbars
+    toolbar: ["axtoolbar"],
+    axtoolbar: ["axtoolbar"],
+    // Disclosure triangles
+    disclosure: ["axdisclosuretriangle"],
+    axdisclosuretriangle: ["axdisclosuretriangle"],
   };
 
   return aliases[normalized] ?? [normalized];
@@ -449,10 +553,15 @@ async function prepareWindowImage(
   };
 }
 
-function getAXTree(appName: string, windowIndex: number): AXElement[] {
+function getAXTree(
+  appName: string,
+  windowIndex: number,
+  maxDepth: number = 6,
+): AXElement[] {
   return runJxaJson<AXElement[]>(String.raw`
 const appName = ${escapeJs(appName)};
 const windowIndex = ${windowIndex};
+const maxDepth = ${maxDepth};
 const process = se.applicationProcesses.byName(appName);
 const window = safe(() => process.windows()[windowIndex - 1], null);
 
@@ -460,13 +569,31 @@ if (!window) {
 	throw new Error("Window " + windowIndex + " not found for " + appName);
 }
 
-function serialize(el, path, depth) {
-	if (depth > 4) return null;
+// Roles that are structural wrappers in Electron/web-based apps.
+// When we hit these, allow going deeper to find actual interactive content.
+const webContainerRoles = new Set([
+	"axwebarea", "axscrollarea", "axgroup", "axlayoutarea",
+	"axsplitgroup", "axtabgroup", "axlist", "axoutline",
+]);
 
+function effectiveMaxDepth(role, baseDepth) {
+	if (webContainerRoles.has(role.toLowerCase())) {
+		// Allow going 2 levels deeper than the configured max for structural wrappers
+		return Math.max(baseDepth, maxDepth + 2);
+	}
+	return baseDepth;
+}
+
+function serialize(el, path, depth, depthLimit) {
+	if (depth > depthLimit) return null;
+
+	const role = String(safe(() => el.role(), "AXUnknown"));
+	const currentLimit = effectiveMaxDepth(role, depthLimit);
 	const children = childElements(el);
+
 	return {
 		path,
-		role: String(safe(() => el.role(), "AXUnknown")),
+		role,
 		subrole: textOrNull(safe(() => el.subrole(), null)),
 		title: textOrNull(safe(() => el.title(), null)),
 		value: textOrNull(safe(() => el.value(), null)),
@@ -474,15 +601,15 @@ function serialize(el, path, depth) {
 		enabled: boolOrFalse(() => el.enabled()),
 		focused: boolOrFalse(() => el.focused()),
 		frame: frameFor(el),
-		children: depth >= 4
+		children: depth >= currentLimit
 			? []
-			: children.slice(0, 60).map((child, index) => serialize(child, path + "." + index, depth + 1)).filter(Boolean),
+			: children.slice(0, 80).map((child, index) => serialize(child, path + "." + index, depth + 1, currentLimit)).filter(Boolean),
 	};
 }
 
 const result = childElements(window)
-	.slice(0, 60)
-	.map((child, index) => serialize(child, String(index), 1))
+	.slice(0, 80)
+	.map((child, index) => serialize(child, String(index), 1, maxDepth))
 	.filter(Boolean);
 
 JSON.stringify(result);
@@ -493,10 +620,26 @@ function buildTargetLookup(
   appName: string,
   windowIndex: number,
   target: AXTarget,
+  mode: "click" | "type" = "click",
 ): string {
   const path = target.path ? escapeJs(target.path) : "null";
   const title = target.title ? escapeJs(target.title) : "null";
   const roles = JSON.stringify(roleCandidates(target.role));
+
+  // For type mode, add fallback chain: role/title search → focused element → any text input
+  const fallbackCode =
+    mode === "type"
+      ? String.raw`
+if (!target) {
+	// Fallback 1: try the currently focused element
+	target = findFocusedElement(window);
+}
+if (!target) {
+	// Fallback 2: try any text-accepting element in the tree
+	target = findAnyTextInput(window);
+}
+`
+      : "";
 
   return String.raw`
 const appName = ${escapeJs(appName)};
@@ -511,10 +654,10 @@ if (!window) {
 	throw new Error("Window " + windowIndex + " not found for " + appName);
 }
 
-const target = targetPath !== null
+var target = targetPath !== null
 	? elementFromPath(window, targetPath)
 	: findElement(window, targetRoles, targetTitle);
-
+${fallbackCode}
 if (!target) {
 	throw new Error("Target element not found");
 }
@@ -528,7 +671,7 @@ function axClick(
 ): boolean {
   return runJxaJson<{
     ok: boolean;
-  }>(`${buildTargetLookup(appName, windowIndex, target)}
+  }>(`${buildTargetLookup(appName, windowIndex, target, "click")}
 let ok = false;
 
 try {
@@ -562,7 +705,7 @@ function axType(
 ): boolean {
   return runJxaJson<{
     ok: boolean;
-  }>(`${buildTargetLookup(appName, windowIndex, target)}
+  }>(`${buildTargetLookup(appName, windowIndex, target, "type")}
 target.value = ${escapeJs(text)};
 JSON.stringify({ok: true});
 `).ok;
@@ -575,7 +718,7 @@ function getElementFrame(
 ): { x: number; y: number; width: number; height: number } | null {
   return runJxaJson<{
     frame: { x: number; y: number; width: number; height: number } | null;
-  }>(`${buildTargetLookup(appName, windowIndex, target)}
+  }>(`${buildTargetLookup(appName, windowIndex, target, "click")}
 JSON.stringify({frame: frameFor(target)});
 `).frame;
 }
@@ -954,7 +1097,9 @@ export function registerWindowTools(server: McpServer): void {
     {
       title: "Get Accessibility Tree",
       description:
-        "Get the accessibility tree for a specific window. Works for background windows and returns JSON with stable element paths for later use with `ax_click` or `ax_type`.",
+        "Get the accessibility tree for a specific window. Works for background windows and returns JSON with stable element paths for later use with `ax_click` or `ax_type`. " +
+        "Default depth is 6, but Electron/web-based apps may need higher values (8-10) to reach interactive elements buried under AXWebArea containers. " +
+        "The tree automatically goes 2 levels deeper for structural web roles (AXWebArea, AXScrollArea, AXGroup, etc.).",
       inputSchema: z
         .object({
           app: z
@@ -966,19 +1111,28 @@ export function registerWindowTools(server: McpServer): void {
             .number()
             .optional()
             .describe("Window index (1-based). Defaults to 1."),
+          max_depth: z
+            .number()
+            .optional()
+            .describe(
+              "Maximum tree traversal depth. Defaults to 6. Use 8-10 for Electron/web-based apps. Web container roles (AXWebArea, AXScrollArea, AXGroup) automatically get +2 extra depth.",
+            ),
         })
         .strict(),
       annotations: { readOnlyHint: true },
     },
     async (args) => {
-      const { app, window_index } = args as {
+      const { app, window_index, max_depth } = args as {
         app: string;
         window_index?: number;
+        max_depth?: number;
       };
+      const depth = Math.min(max_depth ?? 6, 15); // Cap at 15 to avoid perf issues
       return jsonResult({
         app,
         window_index: window_index ?? 1,
-        elements: getAXTree(app, window_index ?? 1),
+        max_depth: depth,
+        elements: getAXTree(app, window_index ?? 1, depth),
       });
     },
   );

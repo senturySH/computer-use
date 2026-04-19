@@ -9,15 +9,13 @@ import {
 	imageToJimp,
 } from '@nut-tree-fork/nut-js';
 import {execFileSync} from 'node:child_process';
-import {readFileSync, unlinkSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
 import {setTimeout} from 'node:timers/promises';
 import Jimp from 'jimp';
 import sharp from 'sharp';
 import {toKeys} from '../xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
 import {CursorOverlay} from './cursor-overlay.js';
+import {getDisplayLayout, captureDisplay as captureDisplayNative} from '../utils/window-capture.js';
 
 // Lazy-init virtual cursor overlay
 let overlay: CursorOverlay | null = null;
@@ -43,27 +41,22 @@ async function syncOverlay(x: number, y: number, style?: string): Promise<void> 
 }
 
 /**
- * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js fails
- * (e.g. on macOS 26+ where CGDisplayCreateImageForRect was removed).
+ * Grab a single display as a Jimp image.
+ *
+ * On macOS, uses the native Swift binary (`capture-display --index N`) which calls
+ * `screencapture -x -D <N>`. The image is at Retina resolution.
+ * On Linux, falls back to nut-js screen.grab() (primary monitor only).
+ *
+ * @param displayIndex 1-based display index (1 = main display). Ignored on Linux.
  */
-async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
-	try {
-		return imageToJimp(await screen.grab());
-	} catch {
-		// Fallback: use screencapture CLI (macOS only)
-		const tmpPath = join(tmpdir(), `computer-use-mcp-${Date.now()}.png`);
-		try {
-			execFileSync('screencapture', ['-x', tmpPath]);
-			const buffer = readFileSync(tmpPath);
-			return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
-		} finally {
-			try {
-				unlinkSync(tmpPath);
-			} catch {
-				/* ignore cleanup errors */
-			}
-		}
+async function grabScreen(displayIndex: number = 1): Promise<ReturnType<typeof imageToJimp>> {
+	if (process.platform === 'darwin') {
+		const buffer = captureDisplayNative(displayIndex);
+		return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
 	}
+
+	// Linux / other: use nut-js (primary monitor only)
+	return imageToJimp(await screen.grab());
 }
 
 // Configure nut-js
@@ -112,11 +105,9 @@ function xdotoolType(text: string): void {
 }
 
 // The Claude API automatically downsamples images larger than ~1.15MP or 1568px on the long edge.
-// We already downsampled screenshots to fit these limits and reported the original screen
-// dimensions via display_width_px/display_height_px, but Claude wasn't correctly using those
-// reported dimensions - it was using coordinates from the downsampled image space directly.
-// As a workaround, we now report the actual image dimensions and scale Claude's coordinates
-// back up to logical screen coordinates.
+// We pre-downsample screenshots to fit these limits and report the actual image dimensions.
+// Claude sends coordinates in the downsampled image space, which we scale back up to
+// logical screen coordinates accounting for multi-monitor offsets.
 // See: https://docs.anthropic.com/en/docs/build-with-claude/vision#evaluate-image-size
 const maxLongEdge = 1568;
 const maxPixels = 1.15 * 1024 * 1024; // 1.15 megapixels
@@ -136,14 +127,132 @@ function getSizeToApiScale(width: number, height: number): number {
 }
 
 /**
- * Get the scale factor from API image coordinates to logical screen coordinates.
- * This is the inverse of the downsampling we apply to fit API limits.
+ * Coordinate mapping between API image space and logical screen coordinates,
+ * scoped to a single display.
+ *
+ * Per-display model:
+ * - Each screenshot captures a SINGLE monitor, not all monitors.
+ * - Coordinates (0,0) in the API image = top-left of THAT monitor.
+ * - The model specifies which display to screenshot/interact with.
+ * - Subsequent mouse/click actions map coordinates relative to the active display.
+ *
+ * The mapping chain:
+ * 1. API image coords → global logical coords: multiply by scale + add display origin
+ * 2. Global logical coords → API image coords: subtract display origin, divide by scale
+ *
+ * The Retina scale factor cancels out algebraically: using the display's logical
+ * dimensions for getSizeToApiScale gives the same mapping as using Retina dimensions.
  */
-async function getApiToLogicalScale(): Promise<number> {
-	const logicalWidth = await screen.width();
-	const logicalHeight = await screen.height();
-	const apiScaleFactor = getSizeToApiScale(logicalWidth, logicalHeight);
-	return 1 / apiScaleFactor;
+interface ScreenMapping {
+	/** Scale factor: multiply API coords by this to get display-local logical coords */
+	scale: number;
+	/** X origin of this display in global logical space */
+	offsetX: number;
+	/** Y origin of this display in global logical space */
+	offsetY: number;
+	/** Display width in logical pixels */
+	displayWidth: number;
+	/** Display height in logical pixels */
+	displayHeight: number;
+	/** 1-based display index */
+	displayIndex: number;
+}
+
+/** Currently active display (set by get_screenshot, used by subsequent actions). */
+let activeDisplayIndex = 1;
+
+/**
+ * Get the screen mapping for a specific display.
+ *
+ * @param displayIndex 1-based display index (1 = main display)
+ */
+function getScreenMapping(displayIndex: number = 1): ScreenMapping {
+	if (process.platform === 'darwin') {
+		const layout = getDisplayLayout();
+
+		// Use the display order from CGGetActiveDisplayList directly.
+		// This order matches `screencapture -D <N>`:
+		//   Index 1 = main display (CGGetActiveDisplayList always returns main first)
+		//   Index 2+ = secondary displays in macOS-internal order
+		// We must NOT re-sort, or the indices will mismatch screencapture -D.
+		const displays = layout.displays;
+		if (displays.length === 0) {
+			// No displays found — fall back to single-monitor defaults
+			return {scale: 1, offsetX: 0, offsetY: 0, displayWidth: 1920, displayHeight: 1080, displayIndex: 1};
+		}
+		const idx = Math.max(1, Math.min(displayIndex, displays.length));
+		const display = displays[idx - 1]!;
+
+		const apiScale = getSizeToApiScale(display.bounds.width, display.bounds.height);
+		return {
+			scale: 1 / apiScale,
+			offsetX: display.bounds.x,
+			offsetY: display.bounds.y,
+			displayWidth: display.bounds.width,
+			displayHeight: display.bounds.height,
+			displayIndex: idx,
+		};
+	}
+
+	// Linux / other: single-monitor fallback using nut-js
+	return getCachedLinuxMapping();
+}
+
+// Linux fallback: cache the screen dimensions
+let linuxMapping: ScreenMapping | null = null;
+
+function getCachedLinuxMapping(): ScreenMapping {
+	if (linuxMapping) return linuxMapping;
+	return {scale: 1, offsetX: 0, offsetY: 0, displayWidth: 1920, displayHeight: 1080, displayIndex: 1};
+}
+
+async function initLinuxMapping(): Promise<void> {
+	if (process.platform !== 'darwin' && !linuxMapping) {
+		const w = await screen.width();
+		const h = await screen.height();
+		const apiScale = getSizeToApiScale(w, h);
+		linuxMapping = {
+			scale: 1 / apiScale,
+			offsetX: 0,
+			offsetY: 0,
+			displayWidth: w,
+			displayHeight: h,
+			displayIndex: 1,
+		};
+	}
+}
+
+/**
+ * Convert API image coordinates to logical screen coordinates.
+ */
+function apiToLogical(apiX: number, apiY: number, mapping: ScreenMapping): [number, number] {
+	return [
+		Math.round(apiX * mapping.scale + mapping.offsetX),
+		Math.round(apiY * mapping.scale + mapping.offsetY),
+	];
+}
+
+/**
+ * Convert logical screen coordinates to API image coordinates.
+ */
+function logicalToApi(logicalX: number, logicalY: number, mapping: ScreenMapping): [number, number] {
+	return [
+		Math.round((logicalX - mapping.offsetX) / mapping.scale),
+		Math.round((logicalY - mapping.offsetY) / mapping.scale),
+	];
+}
+
+/**
+ * Validate that logical coordinates are within the active display's bounds.
+ */
+function validateLogicalCoords(x: number, y: number, mapping: ScreenMapping): void {
+	const {offsetX, offsetY, displayWidth, displayHeight} = mapping;
+	if (x < offsetX || x >= offsetX + displayWidth || y < offsetY || y >= offsetY + displayHeight) {
+		throw new Error(
+			`Coordinates (${x}, ${y}) are outside display ${mapping.displayIndex} bounds ` +
+			`[${offsetX}, ${offsetY}] to [${offsetX + displayWidth}, ${offsetY + displayHeight}]`
+		);
+	}
 }
 
 // Define the action enum values
@@ -164,15 +273,15 @@ const ActionEnum = z.enum([
 const actionDescription = `The action to perform. The available actions are:
 * key: Press a key or key-combination on the keyboard.
 * type: Type a string of text on the keyboard.
-* get_cursor_position: Get the current (x, y) pixel coordinate of the cursor on the screen.
-* mouse_move: Move the cursor to a specified (x, y) pixel coordinate on the screen.
+* get_cursor_position: Get the current (x, y) pixel coordinate of the cursor relative to the active display.
+* mouse_move: Move the cursor to a specified (x, y) pixel coordinate on the active display.
 * left_click: Click the left mouse button. If coordinate is provided, moves to that position first.
-* left_click_drag: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.
+* left_click_drag: Click and drag the cursor to a specified (x, y) pixel coordinate on the active display.
 * right_click: Click the right mouse button. If coordinate is provided, moves to that position first.
 * middle_click: Click the middle mouse button. If coordinate is provided, moves to that position first.
 * double_click: Double-click the left mouse button. If coordinate is provided, moves to that position first.
-* scroll: Scroll the screen in a specified direction. Requires coordinate (moves there first) and text parameter with direction: "up", "down", "left", or "right". Optionally append ":N" to scroll N pixels (default 300), e.g. "down:500".
-* get_screenshot: Take a screenshot of the visible screen. This does not capture covered or background windows that are not currently visible; use \`capture_window\` for those.`;
+* scroll: Scroll at a specified coordinate on the active display. Requires coordinate and text parameter with direction: "up", "down", "left", or "right". Optionally append ":N" to scroll N pixels (default 300), e.g. "down:500".
+* get_screenshot: Take a screenshot of a single display. Use the \`display\` parameter to specify which monitor (1 = main, 2+ = secondary). All subsequent coordinates are relative to that display until the next screenshot.`;
 
 const toolDescription = `Use a mouse and keyboard to interact with a computer, and take screenshots.
 * This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.
@@ -180,9 +289,13 @@ const toolDescription = `Use a mouse and keyboard to interact with a computer, a
 * If you see boxes with two letters in them, typing these letters will click that element. Use this instead of other shortcuts or clicking, where possible.
 * Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try taking another screenshot.
 * Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.
-* \`get_screenshot\` only shows the currently visible screen contents. For background windows, covered windows, or windows you want to target without bringing them to the front, use the window tools: \`windows\`, \`capture_window\`, \`get_ax_tree\`, and \`window_action\`.
+* \`get_screenshot\` captures a single display. Use \`display\` to choose which monitor (1 = main). Coordinates (0,0) = top-left of that monitor. All click/move actions use the same coordinate space as the last screenshot. For background windows, covered windows, or windows you want to target without bringing them to the front, use the window tools: \`windows\`, \`capture_window\`, \`get_ax_tree\`, \`ax_click\`, \`ax_type\`, and \`click_bg_xy\`.
 * If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.
 * Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.
+
+Multi-monitor:
+* Each call to \`get_screenshot\` captures ONE monitor. Specify which monitor with the \`display\` parameter (1 = main, 2+ = secondary). Coordinates in the resulting image are relative to that monitor's top-left (0,0). All subsequent mouse/click actions use that monitor's coordinate space until you take a new screenshot.
+* To see what's on another monitor, call \`get_screenshot\` with a different \`display\` value. Use the \`displays\` subcommand of the \`windows\` tool to list all connected monitors with their indices and dimensions.
 
 Window focus:
 * On macOS, clicking on a window that is not focused (e.g. behind another application) may only bring that window to the front without triggering the actual click on the element. If your click doesn't seem to have had an effect, take a screenshot to verify and click again — the window should now be focused and the second click will register.
@@ -207,6 +320,11 @@ export function registerComputer(server: McpServer): void {
 				action: ActionEnum.describe(actionDescription),
 				coordinate: coordinateSchema.optional(),
 				text: z.string().optional().describe('Text to type or key command to execute'),
+				display: z.number().int().min(1).optional().describe(
+					'Which display to screenshot (1-based, 1 = main display). Only used with get_screenshot. ' +
+					'After a screenshot, all subsequent coordinate-based actions (clicks, moves) target that display ' +
+					'until the next get_screenshot with a different display value.'
+				),
 			}).strict(),
 			// Note: No outputSchema because this tool returns varying content types including images
 			annotations: {
@@ -214,23 +332,24 @@ export function registerComputer(server: McpServer): void {
 			},
 		},
 		async (args) => {
-			const {action, coordinate, text} = args as {action: z.infer<typeof ActionEnum>; coordinate?: [number, number]; text?: string};
+			const {action, coordinate, text, display} = args as {action: z.infer<typeof ActionEnum>; coordinate?: [number, number]; text?: string; display?: number};
+
+			// Initialize Linux mapping if needed
+			await initLinuxMapping();
+
+			// For get_screenshot, update the active display if specified
+			if (action === 'get_screenshot' && display !== undefined) {
+				activeDisplayIndex = display;
+			}
+
+			// Get the screen mapping for the active display
+			const mapping = getScreenMapping(activeDisplayIndex);
 
 			// Scale coordinates from API image space to logical screen space
 			let scaledCoordinate = coordinate;
 			if (coordinate) {
-				const scale = await getApiToLogicalScale();
-				scaledCoordinate = [
-					Math.round(coordinate[0] * scale),
-					Math.round(coordinate[1] * scale),
-				];
-
-				// Validate coordinates are within display bounds
-				const [x, y] = scaledCoordinate;
-				const [width, height] = [await screen.width(), await screen.height()];
-				if (x < 0 || x >= width || y < 0 || y >= height) {
-					throw new Error(`Coordinates (${x}, ${y}) are outside display bounds of ${width}x${height}`);
-				}
+				scaledCoordinate = apiToLogical(coordinate[0], coordinate[1], mapping) as [number, number];
+				validateLogicalCoords(scaledCoordinate[0], scaledCoordinate[1], mapping);
 			}
 
 			// Implement system actions using nut-js
@@ -263,12 +382,13 @@ export function registerComputer(server: McpServer): void {
 
 				case 'get_cursor_position': {
 					const pos = await mouse.getPosition();
-					const scale = await getApiToLogicalScale();
-					// Return coordinates in API image space (scaled down from logical)
+					// Return coordinates in API image space relative to the active display
 					// so Claude can correlate with what it sees in screenshots
+					const [apiX, apiY] = logicalToApi(pos.x, pos.y, mapping);
 					return jsonResult({
-						x: Math.round(pos.x / scale),
-						y: Math.round(pos.y / scale),
+						x: apiX,
+						y: apiY,
+						display: activeDisplayIndex,
 					});
 				}
 
@@ -389,8 +509,8 @@ export function registerComputer(server: McpServer): void {
 					// Get cursor position in logical coordinates
 					const cursorPos = await mouse.getPosition();
 
-					// Capture the entire screen (may be at Retina resolution)
-					const image = await grabScreen();
+					// Capture the active display only (single monitor)
+					const image = await grabScreen(activeDisplayIndex);
 
 					// Then resize to fit within API limits
 					const apiScaleFactor = getSizeToApiScale(image.getWidth(), image.getHeight());
@@ -402,10 +522,8 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					// Calculate cursor position in API image coordinates
-					// cursor is in logical coords, need to convert to API image coords
-					const scale = await getApiToLogicalScale();
-					const cursorInImageX = Math.floor(cursorPos.x / scale);
-					const cursorInImageY = Math.floor(cursorPos.y / scale);
+					// relative to the active display
+					const [cursorInImageX, cursorInImageY] = logicalToApi(cursorPos.x, cursorPos.y, mapping);
 
 					// Draw a crosshair at cursor position (red color)
 					const crosshairSize = 20;
@@ -463,6 +581,9 @@ export function registerComputer(server: McpServer): void {
 									// These may differ from the actual display due to scaling for API limits
 									image_width: imageWidth,
 									image_height: imageHeight,
+									display: activeDisplayIndex,
+									display_width: mapping.displayWidth,
+									display_height: mapping.displayHeight,
 								}),
 							},
 							{

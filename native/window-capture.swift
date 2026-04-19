@@ -19,6 +19,18 @@ struct WindowInfo: Codable {
     let onScreen: Bool
 }
 
+struct DisplayInfo: Codable {
+    let id: UInt32
+    let bounds: WindowBounds
+    let isMain: Bool
+    let scaleFactor: Double
+}
+
+struct DisplayLayout: Codable {
+    let displays: [DisplayInfo]
+    let unifiedBounds: WindowBounds
+}
+
 enum WindowCaptureError: Error {
     case invalidArguments(String)
     case windowNotFound(UInt32)
@@ -92,9 +104,82 @@ func clickWindow(id: UInt32, relativeX: Double, relativeY: Double) throws {
     mouseUp.postToPid(window.ownerPid)
 }
 
+func listDisplays() throws {
+    var displayCount: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &displayCount)
+
+    var displayIds = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+    CGGetActiveDisplayList(displayCount, &displayIds, &displayCount)
+
+    var displays: [DisplayInfo] = []
+    var minX = Int.max
+    var minY = Int.max
+    var maxX = Int.min
+    var maxY = Int.min
+
+    for displayId in displayIds {
+        let rect = CGDisplayBounds(displayId)
+        let x = Int(rect.origin.x)
+        let y = Int(rect.origin.y)
+        let w = Int(rect.size.width)
+        let h = Int(rect.size.height)
+
+        minX = min(minX, x)
+        minY = min(minY, y)
+        maxX = max(maxX, x + w)
+        maxY = max(maxY, y + h)
+
+        // CGDisplayPixelsWide / CGDisplayPixelsHigh give native (backing) pixels
+        // CGDisplayBounds gives logical (point) dimensions
+        let nativeWidth = CGDisplayPixelsWide(displayId)
+        let scaleFactor = w > 0 ? Double(nativeWidth) / Double(w) : 1.0
+
+        displays.append(DisplayInfo(
+            id: UInt32(displayId),
+            bounds: WindowBounds(x: x, y: y, width: w, height: h),
+            isMain: CGDisplayIsMain(displayId) != 0,
+            scaleFactor: scaleFactor
+        ))
+    }
+
+    let unified = WindowBounds(
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY
+    )
+
+    let layout = DisplayLayout(displays: displays, unifiedBounds: unified)
+    let encoder = JSONEncoder()
+    let data = try encoder.encode(layout)
+    FileHandle.standardOutput.write(data)
+}
+
 func listWindows() throws {
     let encoder = JSONEncoder()
     let data = try encoder.encode(allWindows())
+    FileHandle.standardOutput.write(data)
+}
+
+/// Capture a single display by its 1-based index (matching screencapture -D).
+/// Index 1 is the main display. Writes PNG to stdout.
+func captureDisplay(displayIndex: Int) throws {
+    let outputUrl = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("screen-capture-\(ProcessInfo.processInfo.processIdentifier).png")
+
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    task.arguments = ["-x", "-t", "png", "-D", String(displayIndex), outputUrl.path]
+    task.standardError = Pipe()
+
+    try task.run()
+    task.waitUntilExit()
+
+    guard let data = try? Data(contentsOf: outputUrl), !data.isEmpty else {
+        try? FileManager.default.removeItem(at: outputUrl)
+        throw WindowCaptureError.captureFailed(0)
+    }
+    try? FileManager.default.removeItem(at: outputUrl)
     FileHandle.standardOutput.write(data)
 }
 
@@ -153,14 +238,22 @@ func parseRelativeCoordinate(flag: String, args: [String]) throws -> Double {
 do {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let command = args.first else {
-        throw WindowCaptureError.invalidArguments("Usage: window-capture <list|capture|click> [--id <window-id>] [--x <relative-x>] [--y <relative-y>]")
+        throw WindowCaptureError.invalidArguments("Usage: window-capture <list|capture|capture-display|click|displays> [--id <window-id>] [--index <display-index>] [--x <relative-x>] [--y <relative-y>]")
     }
 
     switch command {
     case "list":
         try listWindows()
+    case "displays":
+        try listDisplays()
     case "capture":
         try captureWindow(id: parseWindowId(args: args))
+    case "capture-display":
+        guard let idxPos = args.firstIndex(of: "--index"), args.indices.contains(idxPos + 1),
+              let idx = Int(args[idxPos + 1]), idx >= 1 else {
+            throw WindowCaptureError.invalidArguments("Usage: window-capture capture-display --index <1-based display index>")
+        }
+        try captureDisplay(displayIndex: idx)
     case "click":
         try clickWindow(
             id: parseWindowId(args: args),

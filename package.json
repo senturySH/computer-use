@@ -1,5 +1,5 @@
 {
-  "name": "@pragneshbarik/computer-use",
+  "name": "@sentury/computer-use",
   "version": "2.0.0",
   "description": "💻 MCP server for Claude to control your computer — mouse, keyboard, screenshots, accessibility tree, virtual cursor",
   "license": "MIT",
@@ -11,12 +11,14 @@
   "type": "module",
   "main": "dist/main.js",
   "types": "dist/index.d.ts",
-  "bin": "dist/main.js",
+  "bin": {
+    "computer-use": "dist/main.js"
+  },
   "files": [
     "dist",
     "bin"
   ],
-  "mcpName": "io.github.domdomegg/computer-use-mcp",
+  "mcpName": "io.github.sentury/computer-use",
   "scripts": {
     "start": "npm run build && node dist/main.js",
     "start:http": "npm run build && MCP_TRANSPORT=http node dist/main.js",
